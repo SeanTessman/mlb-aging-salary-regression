@@ -1,0 +1,1026 @@
+---
+title: "Pay, Productivity, and Aging in Major League Baseball: Replication and Extension"
+author: "Sean Tessman"
+subtitle: |
+  STAT3215Q: Applied Linear Regression in Data Science (Fall 2025) \
+  Professor: Elizabeth Schifano \
+date: "12/5/2025"
+
+format:
+  pdf:
+    toc: true
+    number-sections: false
+    fig-cap-location: bottom
+    df-print: default
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: true
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(broom)
+library(knitr)
+library(car)
+library(forcats)
+```
+
+# Section 1. Introduction
+
+The aging curve in professional sports is an important topic because teams must decide how to invest in players, design contracts, and predict future performance. In Major League Baseball (MLB), players' performances are tracked throughout their careers, and change as these athletes mature, peak in performance, and then eventually decline. The study of performance development throughout a player's career helps both player assessment and the wage negotiation process.
+
+Hakes and Turner (2011) studied MLB hitter productivity development through time, while analyzing performance as they age. Using indexed OPS (iOPS) and a quadratic age model to demonstrate that players enhance their performance during their initial years before reaching their peak in their late twenties, to where they then experience performance deterioration. They also examine salary determination as a function of experience and talent.
+
+The main objectives of this project consist of three essential tasks. First, to construct a data set using the Lahman Baseball Database, following the same structure of the original paper. Secondly, to rebuild the primary models used in the original analysis from Hakes and Turner, including the age-productivity regressions, experience regressions, and salary models. Lastly, to extend the analysis by applying modern diagnostic checks for linear regression assumptions and by fitting the models to more modern/recent seasons.
+
+The rest of this report is organized as follows. In Section 2, it describes the data sources, cleaning steps, and variable construction. In Section 3, it shows the regression methods used and original models. In Section 4, it provides extension analysis and diagnostic tests. Section 5 concludes with the main findings and broader takeaways.
+
+# Section 2. Description of Data
+
+All data used comes from the Lahman Baseball Database (version 2023.1), which holds older MLB statistics compiled from publicly available box scores and league records. I use four tables:
+
+1.  Batting.csv - Season-level batting statistics
+
+2.  Salaries.csv - Annual salary data
+
+3.  People.csv - Demographic and biographical data
+
+4.  Fielding.csv - Fielding positions played
+
+Each row in the batting table represents a player and a team-season. Players who played for multiple teams within the same year appear numerous times and must be combined.
+
+```{r}
+#| label: load-raw-data
+
+batting  <- read_csv("data/Batting.csv")
+salaries <- read_csv("data/Salaries.csv")
+people   <- read_csv("data/People.csv")
+fielding <- read_csv("data/Fielding.csv")
+```
+
+```{r}
+#| echo: false
+
+variable_dict <- data.frame(
+  Variable = c(
+    "playerID", "yearID", "age", "experience", 
+    "AB", "H", "BB", "HBP", "SF",
+    "X2B", "X3B", "HR",
+    "OBP", "SLG", "OPS", "iOPS",
+    "primary_pos", "ability_quintile", "peak_iOPS"
+  ),
+  Definition = c(
+    "Unique MLB player identifier",
+    "Season year",
+    "Player age during season (yearID − birthYear)",
+    "Years since MLB debut (yearID − debutYear)",
+    "At-bats",
+    "Hits",
+    "Walks",
+    "Hit-by-pitch",
+    "Sacrifice flies",
+    "Doubles",
+    "Triples",
+    "Home runs",
+    "On-base percentage",
+    "Slugging percentage",
+    "OPS = OBP + SLG",
+    "Indexed OPS standardized by year + position",
+    "Primary fielding position",
+    "Talent group based on 3rd-best career iOPS",
+    "Player’s estimated peak ability"
+  )
+)
+
+kable(variable_dict, caption = "Description of Variables Used in the Analysis")
+
+```
+
+In line with Hakes and Turner (2011), I apply the following filters to construct the data set:
+
+-   "Restrict seasons to 1985-2005 for baseline replication"
+
+-   "Include hitters only, excluding pitchers based on their primary fielding position."
+
+-   "Aggregate statistics across teams within the same year for players who changed teams mid-season."
+
+-   "Merge in birth year and debut year from *People.csv*."
+
+Age is defined as:
+
+*age = yearID - birthYear*
+
+Experience is defined as the number of years since MLB debut:
+
+*experience = yearID - debutYear*
+
+```{r}
+#| label: construct-sample
+#| cache: true
+
+fielding_pos <- fielding %>%
+  filter(!is.na(POS)) %>%
+  group_by(playerID, yearID) %>%
+  summarize(primary_pos = POS[which.max(G)], .groups = "drop")
+
+pitchers <- fielding_pos %>%
+  mutate(is_pitcher = primary_pos == "P") %>%
+  select(playerID, yearID, is_pitcher)
+
+batting_season <- batting %>%
+  group_by(playerID, yearID) %>%
+  summarize(
+    AB      = sum(AB, na.rm = TRUE),
+    H       = sum(H, na.rm = TRUE),
+    BB      = sum(BB, na.rm = TRUE),
+    HBP     = sum(HBP, na.rm = TRUE),
+    SF      = sum(SF, na.rm = TRUE),
+    X2B     = sum(`2B`, na.rm = TRUE),
+    X3B     = sum(`3B`, na.rm = TRUE),
+    HR      = sum(HR, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+batting_season <- batting_season %>%
+  left_join(pitchers, by = c("playerID", "yearID"))
+
+batting_filtered <- batting_season %>%
+  filter(
+    yearID >= 1985, yearID <= 2005,
+    AB >= 130,
+    is_pitcher == FALSE | is.na(is_pitcher)
+  )
+
+people_small <- people %>%
+  select(playerID, birthYear, debut)
+
+batting_filtered <- batting_filtered %>%
+  left_join(people_small, by = "playerID") %>%
+  mutate(
+    age = yearID - birthYear,
+    singles = H - X2B - X3B - HR,
+    OBP = if_else(
+      AB + BB + HBP + SF > 0,
+      (H + BB + HBP) / (AB + BB + HBP + SF),
+      NA_real_
+    ),
+    SLG = if_else(
+      AB > 0,
+      (singles + 2 * X2B + 3 * X3B + 4 * HR) / AB,
+      NA_real_
+    ),
+    OPS = OBP + SLG
+  ) %>%
+  filter(!is.na(OPS), !is.na(age))
+```
+
+Using the following formulas, I am able to compute batting metrics:
+
+**On-base percentage (OBP):**
+
+$$
+OBP = \frac{H + BB + HBP}{AB + BB + HBP + SF}
+$$
+
+**Slugging percentage (SLG):**
+
+$$
+SLG = \frac{1 \cdot 1B + 2 \cdot 2B + 3 \cdot 3B + 4 \cdot HR}{AB}
+$$
+
+**OPS:**
+
+$$
+OPS = OBP + SLG
+$$
+
+**Indexed OPS (iOPS):**
+
+$$
+iOPS =
+\frac{OPS - \overline{OPS}_{year,pos}}
+     {SD(OPS_{year,pos})}
+$$
+
+What this does is standardizes the data by removing era effects and positional differences.
+
+```{r}
+#| label: construct-iops
+#| cache: true
+
+batting_filtered <- batting_filtered %>%
+  left_join(fielding_pos, by = c("playerID", "yearID")) %>%
+  mutate(primary_pos = if_else(is.na(primary_pos), "UNK", primary_pos)) %>%
+  group_by(yearID, primary_pos) %>%
+  mutate(
+    mean_OPS = mean(OPS, na.rm = TRUE),
+    sd_OPS   = sd(OPS, na.rm = TRUE),
+    iOPS     = (OPS - mean_OPS) / sd_OPS
+  ) %>%
+  ungroup()
+```
+
+For each player, I compute their peak ability as the third highest iOPS season in his career. The players from there are then split into five ability groups, or "quintiles", where Q1 represents the lowest ability hitters and Q5 represents the highest ability hitters.
+
+```{r}
+#| label: experience-ability
+#| cache: true
+
+batting_filtered <- batting_filtered %>%
+  mutate(
+    debut_year = year(ymd(debut)),
+    experience = yearID - debut_year
+  ) %>%
+  filter(!is.na(experience), experience >= 0)
+
+peak_ability <- batting_filtered %>%
+  arrange(playerID, desc(iOPS)) %>%
+  group_by(playerID) %>%
+  mutate(rank_iOPS = row_number()) %>%
+  filter(rank_iOPS == 3) %>%
+  summarize(
+    peak_iOPS = iOPS,
+    .groups = "drop"
+  )
+
+batting_filtered <- batting_filtered %>%
+  left_join(peak_ability, by = "playerID") %>%
+  filter(!is.na(peak_iOPS)) %>%
+  mutate(
+    ability_quintile = ntile(peak_iOPS, 5),
+    ability_quintile = factor(ability_quintile,
+                              levels = 1:5,
+                              labels = paste0("Q", 1:5))
+  )
+```
+
+# Section 3. Models and Analysis
+
+## Model Equations
+
+### Age Models (Table 2)
+
+**Model 1 (Pooled Age Model)**
+
+$$
+iOPS = \beta_0 + \beta_1 \,\text{Age} + \beta_2 \,\text{Age}^2 + \varepsilon
+$$
+
+**Model 2 (Different Intercepts by Ability)**
+
+$$
+iOPS = \beta_0 + \beta_1 \,\text{Age} + \beta_2 \,\text{Age}^2
+      + \gamma_q \,\text{QuintileIndicator}_q + \varepsilon
+$$
+
+**Model 3 (Different Slopes by Ability)**
+
+$$
+iOPS =
+\sum_q \beta_{0q}
++ \sum_q \beta_{1q} \,\text{Age}
++ \sum_q \beta_{2q} \,\text{Age}^2
++ \varepsilon
+$$
+
+### Experience Models (Table 3)
+
+**Experience Model 1 (Pooled Experience Model)**
+
+$$
+iOPS = \beta_0 + \beta_1 \,\text{Experience}
+       + \beta_2 \,\text{Experience}^2 + \varepsilon
+$$
+
+**Experience Model 2 (Different Intercepts by Ability)**
+
+$$
+iOPS =
+\beta_0 + \beta_1 \,\text{Experience}
++ \beta_2 \,\text{Experience}^2
++ \gamma_q \,\text{QuintileIndicator}_q
++ \varepsilon
+$$
+
+**Experience Model 3 (Different Slopes by Ability)**
+
+$$
+iOPS =
+\sum_q \beta_{0q}
++ \sum_q \beta_{1q} \,\text{Experience}
++ \sum_q \beta_{2q} \,\text{Experience}^2
++ \varepsilon
+$$
+
+### Salary Models (Table 5)
+
+**Salary Model 1 (Pooled Salary–Experience Model)**
+
+$$
+\log(\text{Salary}) =
+\beta_0
++ \beta_1 \,\text{Experience}
++ \beta_2 \,\text{Experience}^2
++ \varepsilon
+$$
+
+**Salary Model 2 (Different Intercepts by Ability)**
+
+$$
+\log(\text{Salary}) =
+\beta_0
++ \beta_1 \,\text{Experience}
++ \beta_2 \,\text{Experience}^2
++ \sum_q \gamma_q \, Q_q
++ \varepsilon
+$$
+
+**Salary Model 3 (Different Slopes by Ability)**
+
+$$
+\log(\text{Salary}) =
+\sum_q \beta_{0q}
++ \sum_q \beta_{1q} \,\text{Experience}
++ \sum_q \beta_{2q} \,\text{Experience}^2
++ \varepsilon
+$$\
+
+## Hakes & Turner (2011) R² Summary Table
+
+In the original paper and research in Hakes & Turner (2011), there were three output tables to test which variables contributed most in predicting MLB player salary. This study was done over 10 years ago, and the data has been updated throughout the years consistently. Because of this, it's not feasible to replicate their results without having the data from that year exactly as they had it. As a result, one thing that can be replicated to try to reach the same conclusions is producing the R² values, seen in the table below. The overall pattern of these values is that as each table's models get more complex, the R² values increase. As a result the goal was to show this growing R² in the replication model outputs for each table, and show that less variation is left unexplained.
+
+```{r}
+#| echo: false
+
+r2_summary <- tribble(
+  ~Table, ~Model, ~R2,
+  "Table 2 (Age iOPS)",        "Model 1", 0.002,
+  "Table 2 (Age iOPS)",        "Model 2", 0.400,
+  "Table 2 (Age iOPS)",        "Model 3", 0.401,
+  "Table 3 (Experience iOPS)", "Model 1", 0.011,
+  "Table 3 (Experience iOPS)", "Model 2", 0.396,
+  "Table 3 (Experience iOPS)", "Model 3", 0.401,
+  "Table 5 (Salary, yrs 1–6)", "Model 1", 0.511,
+  "Table 5 (Salary, yrs 1–6)", "Model 2", 0.631,
+  "Table 5 (Salary, yrs 1–6)", "Model 3", 0.653,
+  "Table 5 (Salary, yrs 7+)",  "Model 4", 0.067,
+  "Table 5 (Salary, yrs 7+)",  "Model 5", 0.442,
+  "Table 5 (Salary, yrs 7+)",  "Model 6", 0.447
+)
+
+kable(
+  r2_summary,
+  digits = 3,
+  col.names = c("Table", "Model", "R²"),
+  caption = "R-squared values from Tables 2, 3, and 5"
+)
+```
+
+## Table Model Outputs
+
+### Table 2 Models
+
+```{r}
+#| label: age-iops-models
+
+# Drop missing rows
+analysis_data <- batting_filtered %>%
+  filter(!is.na(iOPS),
+                !is.na(age),
+                !is.na(ability_quintile)) %>%
+  mutate(
+    ability_quintile = factor(ability_quintile)
+  )
+
+## Model 1
+model1_age <- lm(iOPS ~ age + I(age^2),
+                 data = analysis_data)
+
+## Model 2
+model2_age <- lm(iOPS ~ age + I(age^2) + ability_quintile,
+                 data = analysis_data)
+
+## Model 3
+model3_age <- lm(
+  iOPS ~ age * ability_quintile + I(age^2) * ability_quintile,
+  data = analysis_data
+)
+print(summary(model1_age))
+print(summary(model2_age))
+print(summary(model3_age))
+
+```
+
+## Analysis
+
+***Table 2 Explanation***
+
+Table 2 in Hakes & Turner (2011) shows how a player’s offensive performance (iOPS) changes with age across three model specifications. To replicate this, 3 individual regressions were run for each model in the paper, and the overall results and interpretation were compared. In Model 1, which pools all players together, the coefficient estimates show an upside-down U-curve, or negative parabola. This means that performance improves early in a player’s career, shown by the positive age coefficient, but then begins to decline as the age² coefficient term turns negative. To understand the proportion of total variation in the response, that's explained by the regression model of Y, the coefficient of determination is analyzed and compared for each model.
+
+In Model 1, about .3% of the variability in player performance can be explained by the relationship with age (R² = 0.003), which indicates that age alone explains very little variation in performance. Model 2 then improves from Model 1 by allowing different intercepts for the ability quintiles. Better performing players tend to start at higher iOPS levels in the MLB, since they are starting their professional career at a higher ability level, and therefore a higher quintile. Between Models 1 and 2, the age and age² coefficients remain similar, but the R² jumps from 0.003 to around 0.33. This means that player ability quintiles help to explain more variation in iOPS than with age alone.
+
+Model 3 then adds even more flexibility by allowing each ability group to have its own slope. This shows that higher quintile hitters peak slightly later but then decline more gradually, while low-quintile hitters peak earlier. In the context of the MLB, this means that as players enter the league already performing in a higher quintile, with better iOPS, then they will perform at that level for a longer duration before hitting their peak and slowly declining in their abilities. In contrast, players that enter the league in a lower performance quintile tend to peak sooner in their careers, at an earlier age.
+
+Although the R² in Model 3 improves only modestly relative to Model 2, from about 0.33 to 0.34, the proportion of total variation in the response is better explained by regression model 3, because the age variable is allowed to vary by ability level. Overall, this confirms the conclusions from the three models that make up Table 2 in Hakes & Turner (2011), because the replicated models show the negative parabola aging pattern, and shows that most variation in a player's offensive production (iOPS) is driven by the differences in players' ability in addition to age.
+
+### Table 3 Models
+
+```{r}
+#| label: model-exp-iops
+
+# Drop missing rows
+analysis_exp <- batting_filtered %>%
+  filter(!is.na(iOPS),
+                !is.na(experience),
+                !is.na(ability_quintile)) %>%
+  mutate(
+    ability_quintile = factor(ability_quintile)
+  )
+
+## Model 1
+model1_exp <- lm(iOPS ~ experience + I(experience^2),
+                 data = analysis_exp)
+
+## Model 2
+model2_exp <- lm(iOPS ~ experience + I(experience^2) + ability_quintile,
+                 data = analysis_exp)
+
+## Model 3
+model3_exp <- lm(
+  iOPS ~ experience * ability_quintile + I(experience^2) * ability_quintile,
+  data = analysis_exp
+)
+print(summary(model1_exp))
+print(summary(model2_exp))
+print(summary(model3_exp))
+
+```
+
+## Analysis
+
+***Table 3 Explanation***
+
+Table 3 in Hakes & Turner (2011) analyzes how offensive performance changes with MLB experience rather than biological age. Like with Table 2, to replicate this, 3 individual regressions were run for each model in the paper, and the overall results and interpretation were compared. Model 1, which pools all players together, shows the same negative parabola shape, which means that performance improves early in a player’s time in the MLB, shown by the positive age coefficient, but then begins to decline as the experience² coefficient term is negative. Like with Table 2, the coefficient of determination is then analyzed and compared for each model.
+
+In Model 1, about 1% of the variability in player performance can be explained by the relationship with experience (R² = 0.01), which indicates that player experience alone explains very little about the variation. Model 2 then improves from Model 1 by allowing different intercepts for the ability quintiles, like with Table 2. The results using Age versus Experience are very similar, because both are measuring performance over time, so whether the model is using a player age 20, and shows increase in age over time, or showing 1 year of experience in the MLB, and increasing over time, the models act the same way. Better performing players tend to start at higher iOPS levels in the MLB, since they are starting their professional career at a higher ability level, and therefore a higher quintile. Between Models 1 and 2, the experience and experience² coefficients remain similar, but the R² jumps from .01 to around 0.33. This means that player ability quintiles help to explain more variation in iOPS than with experience in the league alone.
+
+Like with Table 2, Model 3 then adds even more flexibility by allowing each ability group to have its own slope. Again, this shows that higher quintile hitters peak slightly later but then decline more gradually, while low-quintile hitters peak earlier. Players at a high performance level in early years of experience in the league will perform at a high level longer, than gradually decline, where players in a lower quintile of ability in early years in the league will peak sooner.
+
+In a similar conclusion to Table 2, although the R² in Model 3 improves only modestly relative to Model 2, from about 0.33 to 0.34, the proportion of total variation in the response is better explained by regression model 3, because the experience variable is allowed to vary by ability level. Overall, this confirms the conclusions from the three models that make up Table 3 in Hakes & Turner (2011), because the replicated models show the negative parabola aging pattern, and shows that experience is a useful predictor of performance when accounting for the various ability quintiles.
+
+### Table 5 Models
+
+```{r}
+#| label: salary-models
+
+# Salary data
+salary_by_year <- salaries %>%
+  group_by(playerID, yearID) %>%
+  summarize(salary = sum(salary, na.rm = TRUE), .groups = "drop")
+
+salary_data <- batting_filtered %>%
+  inner_join(salary_by_year, by = c("playerID", "yearID")) %>%
+  mutate(
+    lnsalary        = log(salary),
+    ability_quintile = fct_relevel(ability_quintile, "Q1", "Q2", "Q3", "Q4", "Q5")
+  ) %>%
+  filter(
+    is.finite(lnsalary),
+    !is.na(experience),
+    experience >= 1       
+  )
+
+# Split into years 1–6 vs 7+
+salary_1to6 <- salary_data %>% filter(experience <= 6)
+salary_7plus <- salary_data %>% filter(experience >= 7)
+
+## Model 1 (years 1–6)
+salary_m1 <- lm(
+  lnsalary ~ experience + I(experience^2),
+  data = salary_1to6
+)
+
+## Model 2 (years 1–6)
+salary_m2 <- lm(
+  lnsalary ~ experience + I(experience^2) + ability_quintile,
+  data = salary_1to6
+)
+
+## Model 3 (years 1–6)
+salary_m3 <- lm(
+  lnsalary ~ experience * ability_quintile +
+    I(experience^2) * ability_quintile,
+  data = salary_1to6
+)
+
+## Model 4 (years 7+)
+salary_m4 <- lm(
+  lnsalary ~ experience + I(experience^2),
+  data = salary_7plus
+)
+
+## Model 5 (years 7+)
+salary_m5 <- lm(
+  lnsalary ~ experience + I(experience^2) + ability_quintile,
+  data = salary_7plus
+)
+
+## Model 6 (years 7+)
+salary_m6 <- lm(
+  lnsalary ~ experience * ability_quintile +
+    I(experience^2) * ability_quintile,
+  data = salary_7plus
+)
+
+print(summary(salary_m1))
+print(summary(salary_m2))
+print(summary(salary_m3))
+print(summary(salary_m4))
+print(summary(salary_m5))
+print(summary(salary_m6))
+```
+
+## Analysis
+
+***Table 5 Explanation***
+
+Table 5 in Hakes & Turner (2011) shows a combination of the previous tables by analyzing how salary responds to experience and talent performance, by ability quintile, during the early and late stages of a player's career. The paper considered the early career stage to be years 1-6 for the player in the MLB, and late career to be years 7+. Like the first two tables, 3 models are run for each career stage.
+
+In the early career stage, Model 1 pools all players together and shows that salary grows quickly at a positive rate early on, explained by the positive experience and experience² coefficients. This is suggesting that players accumulate value as they gain experience and prove themselves in the MLB, but Model 1 fails to show differences in ability causing a larger proportion of unexplained variation (R² = 0.43). Model 2 shows an improvement, as the R² increases from 0.43 to around 0.48, by allowing each ability quintile group to have a different starting salary level. This explains how higher-ability players will earn more than other players in different ability quintiles, even being in the same early career experience stage. Model 3 improves even further from Model 2, with the R² increasing from 0.48 to around 0.51, because the experience effects are coupled with the various quintiles. This combination of coefficients results in the most proportion of total variation being explained by the regression, and is the best fit. The estimates explain that high-ability quintile players have higher salaries and grow their salaries more rapidly, whereas the lower-ability quintile players' salaries peak sooner and grow more slowly.
+
+In the late career stage, the models have the same structure, where the salary growth becomes more stable and flat, but the experience² is negative, and the peak shifts towards mid-career. This is suggesting that as players progress later in their careers, their salary bargaining power declines. Model 4 has a larger proportion of unexplained variation (R² = 0.009), and shows more flat salary growth as the experience coefficient goes from 0.39 in Model 1 to 0.20 in Model 4. Model 5 shows an improvement, as the R² increases from 0.009 to around 0.33. Model 6 improves slightly from Model 5, with the R² increasing from 0.33 to around 0.34, as it allows for quintile-specific intercepts and slopes to keep improving model fit. This demonstrates that player talent continues to drive salary variation deep into a player’s career, because the experience effects are coupled with the various ability quintiles. This combination of coefficients results in the most proportion of total variation being explained by the regression, and is the best fit. The estimates explain that high-ability quintile players have higher salaries and grow their salaries more rapidly, whereas the lower-ability quintile players' salaries peak sooner and grow more slowly. Overall, Table 5 shows that salary is strongly connected to the underlying ability quintiles, and that players are compensated not only for their accumulated experience in the league, but also for their relative talent level, with higher-ability players maintaining higher salaries throughout their careers, which confirms the conclusions from the three models that make up Table 5 in Hakes & Turner (2011).
+
+# Section 4. Extension/Enhancement
+
+## Part 1 - Regression Diagnostics & Assumption Checks
+
+The following standard regression assumptions for the main models were assessed:
+
+1.  Linearity
+2.  Homoscedasticity
+3.  Errors have mean 0
+4.  Errors are uncorrelated (Independence)
+5.  Normality of errors
+
+### 1. Linearity
+
+*Table 2 - Age Model 3*
+
+```{r}
+mod1 <- model3_age
+
+par(mfrow = c(1, 1))
+plot(mod1, which = 1) 
+
+
+```
+
+*Table 3 - Experience Model 3*
+
+```{r}
+mod2 <- model3_exp
+
+par(mfrow = c(1, 1))
+plot(mod2, which = 1)
+
+```
+
+*Table 5 - Salary Model 3*
+
+```{r}
+mod3 <- salary_m3
+
+par(mfrow = c(1, 1))
+plot(mod3, which = 1)
+
+```
+
+***Conclusion***
+
+In each of the model plots, the residuals are mostly centered around zero across the whole range of fitted values. There is no systematic pattern or clustering that would suggest a missing nonlinear term. In this context, this is expected because the model already includes both the coefficient and the coefficient squared for each model (age, experience, and salary), as well as interactions with ability quintiles, which provides more flexibility when capturing the negative parabola shape of each curve.
+
+The vertical groupings of points reflect that many players share similar predicted iOPS values within a certain ability quintile. This makes sense in the context of the baseball data since each quintile was grouped based on iOPS and ability, and does not signal a linearity violation. While the spread of residuals increases slightly at higher fitted values, which indicates some heteroscedasticity, the pattern remains more random, so the linearity assumption is reasonably satisfied, as the quadratic terms and interaction effects with ability appear to capture the relationship appropriately.
+
+### 2. Homoscedasticity
+
+```{r}
+age_model <- model3_age
+experience_model <- model3_exp
+salary_model <- salary_m3
+
+library(lmtest)
+age_test <- bptest(age_model)
+experience_test <- bptest(experience_model)
+salary_test <- bptest(salary_model)
+
+print(age_test)
+print(experience_test)
+print(salary_test)
+
+```
+
+***Conclusion***
+
+In order to test for homoscedasticity, the previous residual vs fitted plots can be assessed as well as by performing a Breusch-Pagan test for each model. In each model's plot, the spread of residuals changes as the fitted values increase, with more vertical spread in the center and to the right of the plots. In addition, with the Breush-Pagan test, each model results in extremely small p-values \< 2.2e-16. As a result, this assumption does not meet homoscedasticity, which doesn't impact the coefficient estimates, but does bias the standard errors in the model, so it's better to proceed with caution with the given models, as they may not be trustworthy.
+
+### 3. Errors Have Mean 0
+
+```{r}
+age_model <- model3_age
+experience_model <- model3_exp
+salary_model <- salary_m3
+
+m1 <- mean(residuals(age_model))
+m2 <- mean(residuals(experience_model))
+m3 <- mean(residuals(salary_model))
+
+print(m1)
+print(m2)
+print(m3)
+
+```
+
+***Conclusion***
+
+To meet the errors have mean 0 assumption, the mean of the residuals should be essentially zero. This holds true for all 3 of the best models from each table, as they are all such small decimals that they are essentially equivalent to zero. This supports the assumption that the errors have mean 0 for the research models.
+
+### 4. Errors are Uncorrelated (Independence)
+
+*Table 2 - Age Model*
+
+```{r}
+mod <- model3_age
+
+diag_df <- data.frame(
+  resid   = residuals(mod),
+  fitted  = fitted(mod),
+  yearID  = analysis_data$yearID,
+  playerID = analysis_data$playerID
+)
+
+plot(diag_df$resid, type = "l",
+     xlab = "Observation index",
+     ylab = "Residual",
+     main = "Residuals in data order")
+abline(h = 0, col = "red", lty = 2)
+
+library(lmtest)
+dwtest(mod)
+
+```
+
+*Table 3 - Experience Model*
+
+```{r}
+mod2 <- model3_exp 
+
+diag_df2 <- data.frame(
+  resid   = residuals(mod),
+  fitted  = fitted(mod),
+  yearID  = analysis_data$yearID,
+  playerID = analysis_data$playerID
+)
+
+plot(diag_df2$resid, type = "l",
+     xlab = "Observation index",
+     ylab = "Residual",
+     main = "Residuals in data order")
+abline(h = 0, col = "red", lty = 2)
+
+library(lmtest)
+dwtest(mod2)
+
+```
+
+*Table 5 - Salary Model*
+
+```{r}
+mod3 <- salary_m3
+
+diag_df3 <- data.frame(
+  resid   = residuals(mod),
+  fitted  = fitted(mod),
+  yearID  = analysis_data$yearID,
+  playerID = analysis_data$playerID
+)
+
+plot(diag_df3$resid, type = "l",
+     xlab = "Observation index",
+     ylab = "Residual",
+     main = "Residuals in data order")
+abline(h = 0, col = "red", lty = 2)
+
+library(lmtest)
+dwtest(mod3)
+
+```
+
+***Conclusion***
+
+The models drawn from each table do not meet the independence assumption. First, using the residual-in-order plot, there appear to be some slight wave-like patterns in the residuals, and not fully random, which would suggest dependence. In addition, a more formal way to check this assumption is by using the Durbin-Watson test. The test output shows that the p-value \< 2.2e-16, so the null hypothesis of independence would be rejected.
+
+### 5. Normality of Errors
+
+*Table 2 - Age Model*
+
+```{r}
+mod <- model3_age
+
+plot(mod, which = 2)
+
+hist(residuals(mod), breaks = 40, main = "Residuals", xlab = "Residual")
+
+shapiro.test(sample(residuals(mod), size = min(5000, length(residuals(mod)))))
+
+```
+
+*Table 3 - Experience Model*
+
+```{r}
+mod2 <- model3_exp
+
+plot(mod2, which = 2)
+
+hist(residuals(mod2), breaks = 40, main = "Residuals", xlab = "Residual")
+
+shapiro.test(sample(residuals(mod2), size = min(5000, length(residuals(mod2)))))
+
+```
+
+*Table 5 - Salary Model*
+
+```{r}
+mod3 <- salary_m3
+
+plot(mod3, which = 2)
+
+hist(residuals(mod3), breaks = 40, main = "Residuals", xlab = "Residual")
+
+shapiro.test(sample(residuals(mod3), size = min(5000, length(residuals(mod3)))))
+
+```
+
+***Conclusion***
+
+To test normality for each table's models, a Q-Q plot and Shapiro-Wilk test were run. The Q–Q plot compares the standardized residuals from the regression to what we would expect to see if the errors were perfectly normally distributed. In this plot, the middle portion of the residuals are almost exactly along the line, indicating that the majority of the residuals mostly follow a normal distribution. However, at both far right and left on the plot, the points deviate slightly upward or downward from the line. These movements make sense with the context of baseball performance data, because extreme seasons with very high or very low player iOPS are relatively rare, so it makes it harder to model accurately, as they are outliers in the data. The slight curves at each end do not show a major violation to normality because of this, so for a large data set like this one, some tail movement is fully expected, and the plots show stronger normality. The Shapiro–Wilk test produces a significant p-value, where p \< 2.2e−16. This result, however, is expected for large sample sizes since the test has extreme sensitivity, and doesn't support a linearity violation. With the visual evidence from the Q–Q plots and the large number of observations, the normality assumption is reasonably satisfied for these models, and any minor tail movements due to outliers and extreme data are unlikely to have an impact.
+
+### Assumptions Extension Summary
+
+In Hakes & Turner (2011), there was no clear evidence or model results to support if regression assumptions were properly checked. As a project extension, it felt important to ensure that the models being used for analysis and conclusions can be trusted based on these assumptions. With the results above, it can be concluded that the models meet the main assumptions of linearity, mean-zero errors, and approximate normality. This indicates that the general form and overall regression structure are appropriate. However, the models do not meet the assumptions of homoscedasticity or independence. These violations do not compromise the coefficient estimates, but they do affect the reliability of standard errors and hypothesis tests. As a result, the fitted models provide meaningful estimates of the age curves, experience effects, and salary predictors, and there is a large sample size, so the models can generally be trusted, but interpreting results and using the standard error values can be analyzed with some caution.
+
+## Part 2 - Extending the Data Set
+
+### Filtering the Data
+
+To extend this project, and to see if the results and conclusions change with more modern data, the original data set was expanded to include all available years past 2005 (up to 2023). This data was then re-run through the models from before, to asses whether any conclusions changed.
+
+```{r}
+people_small <- people %>%
+select(playerID, birthYear, debut)
+
+# Hitters only
+
+batting_filtered_23 <- batting_season %>%
+filter(
+yearID >= 1985, yearID <= 2023,
+AB >= 130,
+is_pitcher == FALSE | is.na(is_pitcher)
+) %>%
+left_join(people_small, by = "playerID") %>%
+mutate(
+age     = yearID - birthYear,
+singles = H - X2B - X3B - HR,
+OBP = if_else(
+AB + BB + HBP + SF > 0,
+(H + BB + HBP) / (AB + BB + HBP + SF),
+NA_real_
+),
+SLG = if_else(
+AB > 0,
+(singles + 2 * X2B + 3 * X3B + 4 * HR) / AB,
+NA_real_
+),
+OPS = OBP + SLG
+) %>%
+filter(!is.na(OPS), !is.na(age))
+
+
+batting_filtered_23 <- batting_filtered_23 %>%
+left_join(fielding_pos, by = c("playerID", "yearID")) %>%
+mutate(primary_pos = if_else(is.na(primary_pos), "UNK", primary_pos)) %>%
+group_by(yearID, primary_pos) %>%
+mutate(
+mean_OPS = mean(OPS, na.rm = TRUE),
+sd_OPS   = sd(OPS,  na.rm = TRUE),
+iOPS     = (OPS - mean_OPS) / sd_OPS
+) %>%
+ungroup()
+
+
+batting_filtered_23 <- batting_filtered_23 %>%
+mutate(
+debut_year = year(ymd(debut)),
+experience = yearID - debut_year
+) %>%
+filter(!is.na(experience), experience >= 0)
+
+
+peak_ability_23 <- batting_filtered_23 %>%
+arrange(playerID, desc(iOPS)) %>%
+group_by(playerID) %>%
+mutate(rank_iOPS = row_number()) %>%
+filter(rank_iOPS == 3) %>%
+summarize(
+peak_iOPS = iOPS,
+.groups   = "drop"
+)
+
+batting_filtered_23 <- batting_filtered_23 %>%
+left_join(peak_ability_23, by = "playerID") %>%
+filter(!is.na(peak_iOPS)) %>%
+mutate(
+ability_quintile = ntile(peak_iOPS, 5),
+ability_quintile = factor(
+ability_quintile,
+levels = 1:5,
+labels = paste0("Q", 1:5)
+)
+)
+
+
+analysis_age_23 <- batting_filtered_23 %>%
+filter(!is.na(iOPS), !is.na(age), !is.na(experience), !is.na(ability_quintile))
+```
+
+### Extended Data Set Models
+
+*Age Models*
+
+```{r}
+#| label: age-iops-models_23
+
+# Drop missing rows
+analysis_data <- batting_filtered_23 %>%
+  filter(!is.na(iOPS),
+                !is.na(age),
+                !is.na(ability_quintile)) %>%
+  mutate(
+    ability_quintile = factor(ability_quintile)
+  )
+
+## Model 1
+model1_age_23 <- lm(iOPS ~ age + I(age^2),
+                 data = analysis_data)
+
+## Model 2
+model2_age_23 <- lm(iOPS ~ age + I(age^2) + ability_quintile,
+                 data = analysis_data)
+
+## Model 3
+model3_age_23 <- lm(
+  iOPS ~ age * ability_quintile + I(age^2) * ability_quintile,
+  data = analysis_data
+)
+print(summary(model1_age_23))
+print(summary(model2_age_23))
+print(summary(model3_age_23))
+
+```
+
+*Experience Models*
+
+```{r}
+#| label: model-exp-iops_23
+
+# Drop missing rows
+analysis_exp <- batting_filtered_23 %>%
+  filter(!is.na(iOPS),
+                !is.na(experience),
+                !is.na(ability_quintile)) %>%
+  mutate(
+    ability_quintile = factor(ability_quintile)
+  )
+
+## Model 1
+model1_exp_23 <- lm(iOPS ~ experience + I(experience^2),
+                 data = analysis_exp)
+
+## Model 2
+model2_exp_23 <- lm(iOPS ~ experience + I(experience^2) + ability_quintile,
+                 data = analysis_exp)
+
+## Model 3
+model3_exp_23 <- lm(iOPS ~ experience * ability_quintile + I(experience^2) * ability_quintile,
+  data = analysis_exp
+)
+print(summary(model1_exp_23))
+print(summary(model2_exp_23))
+print(summary(model3_exp_23))
+
+```
+
+*Salary Models*
+
+```{r}
+#| label: salary-models_23
+
+# Salary data
+salary_by_year <- salaries %>%
+  group_by(playerID, yearID) %>%
+  summarize(salary = sum(salary, na.rm = TRUE), .groups = "drop")
+
+salary_data <- batting_filtered_23 %>%
+  inner_join(salary_by_year, by = c("playerID", "yearID")) %>%
+  mutate(
+    lnsalary        = log(salary),
+    ability_quintile = fct_relevel(ability_quintile, "Q1", "Q2", "Q3", "Q4", "Q5")
+  ) %>%
+  filter(
+    is.finite(lnsalary),
+    !is.na(experience),
+    experience >= 1       
+  )
+
+# Split into years 1–6 vs 7+
+salary_1to6 <- salary_data %>% filter(experience <= 6)
+salary_7plus <- salary_data %>% filter(experience >= 7)
+
+## Model 1 (years 1–6)
+salary_m1_23 <- lm(
+  lnsalary ~ experience + I(experience^2),
+  data = salary_1to6
+)
+
+## Model 2 (years 1–6)
+salary_m2_23 <- lm(
+  lnsalary ~ experience + I(experience^2) + ability_quintile,
+  data = salary_1to6
+)
+
+## Model 3 (years 1–6)
+salary_m3_23 <- lm(
+  lnsalary ~ experience * ability_quintile +
+    I(experience^2) * ability_quintile,
+  data = salary_1to6
+)
+
+## Model 4 (years 7+)
+salary_m4_23 <- lm(
+  lnsalary ~ experience + I(experience^2),
+  data = salary_7plus
+)
+
+## Model 5 (years 7+)
+salary_m5_23 <- lm(
+  lnsalary ~ experience + I(experience^2) + ability_quintile,
+  data = salary_7plus
+)
+
+## Model 6 (years 7+)
+salary_m6_23 <- lm(
+  lnsalary ~ experience * ability_quintile +
+    I(experience^2) * ability_quintile,
+  data = salary_7plus
+)
+
+print(summary(salary_m1_23))
+print(summary(salary_m2_23))
+print(summary(salary_m3_23))
+print(summary(salary_m4_23))
+print(summary(salary_m5_23))
+print(summary(salary_m6_23))
+```
+
+### Extended Data Set Conclusion
+
+When the models were re-estimated using the expanded data set, the overall structure and key relationships that were observed in the original data set remained constant, but there were a few important differences.
+
+The extended age models still show the negative parabola aging curve, where players improve early before gradually declining. This confirms that the aging pattern and shape that was identified by Hakes & Turner (2011) remains a true characteristic of MLB hitters even with almost 20 additional years of data. However, one difference is that the curve of the extended model's becomes slightly flatter. This suggests that players in recent years may keep higher performance longer than hitters from the earlier period. The ability quintiles impact on the data remained strong, and in the extended model's, the separation of Q1 and Q5 widens which suggests larger separation of performance between groups over time.
+
+Like in the original outputs, the extended experience models continue to show early improvement in a MLB player's career, followed by a decline. However, just like in the extended age model, the peak shifts slightly later and the more modern hitters maintain higher performance deeper into their careers. The R² values in the extended models stayed nearly the same to the previous estimates showing that the performance quintile grouping is still the strongest predictor of iOPS. One change is that the interaction terms for higher quintile hitters show slightly smaller declines at higher experience levels, which suggests that elite modern hitters might age better than early era players.
+
+The salary models continue to show strong grouping by ability quintile, which is consistent in both the original and extended models' behavior. In the early career models, the salary growth with experience still climbs quickly early in a player’s career, but the increase is less steep compared to earlier years. In the late career models, the decline in salary with additional experience in the league becomes stronger in the extended years' models. This shows that the MLB is less whilling to pay older players with more years in the league higher salaries towards the end of their career, compared to the prior era. This has shown in more negative experience² terms and flatter experience slopes. Despite these changes R² patterns in the extended years' models closely match the original year filter models. Across all of the models, hitters continue to follow a predictable age and experience curve, player ability quintiles remain the strongest driver of performance and salary and the more modern era data shows slightly altered shapes of these curves. As a result, the extended models further reinforce the main conclusions of Hakes & Turner (2011) while still capturing some important changes reflected in the modern era regarding performance aging and salary patterns for older players.
+
+# Section 5. Discussion
+
+This final project was intended to recreate and extend the main results and conclusions of Hakes & Turner (2011) by modeling MLB player performance and salary patterns, using the original 1985-2005 data set from the paper and then again using expanded data that is now available through 2023. Across both data sets the main conclusions were very similar. Performance, measured with iOPS, increased steadily earlier in a players career, peaked in the late 20's, and then declined along the expected negative parabola age and experience curves. By adding in ability quintiles, the model's improved which showed that higher ability players peak later and maintain stronger performance longer, where lower ability players peak sooner and decline quicker.
+
+The salary models showed a similar structure, for players within their first 6 years (early career) salaries rise quickly with experience due to increasing productivity, and then after year 7 (late career) the relationship flattens and ability is the main predictor of salary earnings. When the data was extended through 2023, these patterns were even more clear, because the modern MLB salaries showed even more separation between the ability quintile levels. The expanded models keep the same shape and interpretation of the original study, but give a more up to date picture of MLB salary patterns.
+
+The other extension that was performed was checking assumptions. These checks broadly supported the use of linear models, but suggest caution should still be taken. Linearity and mean-0 errors were satisfied well, and the residuals showed acceptable normality for using a large sample. Homoscedasticity and independence were not fully satisfied, however, these would impact standard errors more than coefficient estimates and they don't change the overall conclusions of the paper.
+
+Overall, the original and extended years' models are in line with the Hakes & Turner (2011) research and conclusions. The analysis and extended data confirm the stability of MLB performance aging and experience curves while showing how modern salaries have become more ability driven. While the exact numbers in the model results are not exact to the Hakes & Turner (2011) research, this is to be expected because they used the data back in 2011, when fewer years were available. Since then, this data has continued to be updated, adjusted, and enhanced, so even the prior years data will look slightly different than from when it was pulled from the original research paper. The main goal was to replicate the overall conclusions and analysis on MLB performance and salaries among players. The replicated and extended data sets support Hakes & Turner (2011), and strengthens the original studies analysis by providing a more modern view of MLB career progression and salary earnings.
+
+# References
+
+Hakes, J. K., & Turner, C. (2011). Pay, productivity and aging in Major League Baseball. Journal of Productivity Analysis, 35(1), 61–74. https://doi.org/10.1007/s11123-009-0152-8
+
+Lahman, S. (2023). Lahman Baseball Database \[Data set\]. https://www.seanlahman.com/baseball-archive/statistics/
